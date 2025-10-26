@@ -39,6 +39,8 @@ endif()
 find_package(pybind11 REQUIRED CONFIG)
 
 # DuckDB
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=x86-64-v3")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=x86-64-v3")
 include(cmake/duckdb_loader.cmake)
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   duckdb_configure_for_debug()
