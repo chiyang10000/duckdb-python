@@ -46,6 +46,8 @@ enum class NumpyNullableType : uint8_t {
 	//! ------------------------------------------------------------
 	CATEGORY, //! category
 	STRING,   //! string
+
+	FIXED_WIDTH_STRING, //! fixed-width string
 };
 
 struct NumpyType {
@@ -53,6 +55,7 @@ struct NumpyType {
 	//! Optionally if the type is a DATETIME,
 	//! this indicates whether the type has timezone information
 	bool has_timezone = false;
+	uint32_t fixed_width_str_len = 0; // static length of a fixed-width string, 0 if not applicable
 };
 
 enum class NumpyObjectType : uint8_t {
