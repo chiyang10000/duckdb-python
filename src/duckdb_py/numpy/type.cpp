@@ -55,6 +55,9 @@ static NumpyNullableType ConvertNumpyTypeInternal(const string &col_type_str) {
 	if (col_type_str == "float64" || col_type_str == "Float64") {
 		return NumpyNullableType::FLOAT_64;
 	}
+	if (StringUtil::StartsWith(col_type_str, "|S")) {
+		return NumpyNullableType::FIXED_WIDTH_STRING;
+	}
 	if (col_type_str == "string") {
 		return NumpyNullableType::STRING;
 	}
@@ -119,6 +122,9 @@ NumpyType ConvertNumpyType(const py::handle &col_type) {
 			numpy_type.has_timezone = true;
 		}
 	}
+	if (numpy_type.type == NumpyNullableType::FIXED_WIDTH_STRING) {
+		numpy_type.fixed_width_str_len = std::stoi(col_type_str.substr(col_type_str.find('S') + 1));
+	}
 	return numpy_type;
 }
 
@@ -148,6 +154,7 @@ LogicalType NumpyToLogicalType(const NumpyType &col_type) {
 		return LogicalType::FLOAT;
 	case NumpyNullableType::FLOAT_64:
 		return LogicalType::DOUBLE;
+	case NumpyNullableType::FIXED_WIDTH_STRING:
 	case NumpyNullableType::STRING:
 		return LogicalType::VARCHAR;
 	case NumpyNullableType::OBJECT:
