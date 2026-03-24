@@ -1362,6 +1362,14 @@ void DuckDBPyRelation::ToParquet(const string &filename, const py::object &compr
 		}
 		options["use_tmp_file"] = {Value::BOOLEAN(py::bool_(use_tmp_file))};
 	}
+	options["parquet_version"] = {Value(py::str("V2"))};
+	options["write_bloom_filter"] = {Value::BOOLEAN(false)};
+	if (py::none().is(row_group_size)) {
+		options["row_group_size"] = {Value(1048576)};
+	}
+	if (py::none().is(compression)) {
+		options["compression"] = {Value(py::str("zstd"))};
+	}
 
 	if (!py::none().is(filename_pattern)) {
 		if (!py::isinstance<py::str>(filename_pattern)) {
