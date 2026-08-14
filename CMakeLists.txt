@@ -42,12 +42,17 @@ find_package(pybind11 REQUIRED CONFIG)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=x86-64-v3")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=x86-64-v3")
 include(cmake/duckdb_loader.cmake)
+list(APPEND DUCKDB_EXTENSION_CONFIGS
+     "${CMAKE_CURRENT_SOURCE_DIR}/extension/twn/extension_config.cmake")
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   duckdb_configure_for_debug()
 else()
   duckdb_configure_for_release()
 endif()
 duckdb_add_library(duckdb_target)
+if(NOT "twn" IN_LIST BUILD_EXTENSIONS)
+  list(APPEND BUILD_EXTENSIONS twn)
+endif()
 
 # Bundle in INTERFACE library
 add_library(_duckdb_dependencies INTERFACE)
