@@ -1,11 +1,17 @@
+import ctypes
 import struct
 
+import lmdb
+import numpy as np
 import pytest
+from hft import c as hft_c
+from hft import ob as hft_orderbook
 
 import duckdb
 
 DECISION_RECORD_SIZE = 8712
 EXECUTION_RECORD_SIZE = 304
+HFT_KEY = 1304989
 
 
 def write_decision(path):
@@ -51,6 +57,22 @@ def execution_record(local_time_ns, key, clord_id, text):
     record[149:173] = b"20260813-01:02:03.123".ljust(24, b"\0")
     record[173:301] = text.ljust(128, b"\0")
     return record
+
+
+def write_action_fixture(dir_action, key=HFT_KEY):
+    arr_action = np.zeros(4, dtype=hft_orderbook.ACTION_DTYPE)
+    arr_action["side"] = [1, -1, 1, -1]
+    arr_action["time"] = [1786580992000000000, 100, 100, 100]
+    arr_action["price"] = [100, 102, 102, 100]
+    arr_action["volume"] = [10, 20, 5, 3]
+    hft_c.lib.c_database_write(
+        str(dir_action).encode(),
+        b"fixture",
+        ctypes.c_int32(key),
+        arr_action.ctypes._as_parameter_,
+        len(arr_action),
+    )
+    return dir_action / "fixture-bin", arr_action
 
 
 def test_read_twn_decision(tmp_path):
@@ -104,6 +126,58 @@ def test_read_twn_execution(tmp_path):
         (100, 1234, "3", "A1", "2330", "first"),
         (200, 5678, "3", "B2", "2330", "second"),
     ]
+
+
+def test_hft_ob_matches_hft_extract(tmp_path):
+    path_action, arr_action = write_action_fixture(tmp_path)
+    arr_expected = hft_orderbook.Orderbook().extract(arr_action)
+
+    connection = duckdb.connect()
+    cursor = connection.execute("SELECT * FROM hft_ob(?, ?)", [str(path_action), HFT_KEY])
+    list_column = [column[0] for column in cursor.description]
+    list_type = [str(column[1]) for column in cursor.description]
+    column2array = cursor.fetchnumpy()
+    arr_actual = np.column_stack([column2array[column] for column in list_column])
+
+    assert list_column == hft_orderbook.sources
+    assert list_type == ["FLOAT"] * len(hft_orderbook.sources)
+    np.testing.assert_allclose(arr_actual, arr_expected, rtol=0, atol=0, equal_nan=True)
+    assert connection.execute("SELECT count(*) FROM hft_ob(?, ?)", [str(path_action), HFT_KEY]).fetchone() == (4,)
+
+
+def test_hft_ob_rejects_missing_key(tmp_path):
+    path_action, _ = write_action_fixture(tmp_path)
+
+    with pytest.raises(duckdb.IOException, match="HFT action key 1 not found"):
+        duckdb.execute("SELECT count(*) FROM hft_ob(?, ?)", [str(path_action), 1])
+
+
+def test_hft_ob_rejects_missing_or_invalid_file(tmp_path):
+    path_missing = tmp_path / "missing-bin"
+    with pytest.raises(duckdb.IOException, match="Failed to open LMDB environment"):
+        duckdb.execute("SELECT count(*) FROM hft_ob(?, ?)", [str(path_missing), HFT_KEY])
+
+    path_invalid = tmp_path / "invalid-bin"
+    path_invalid.write_bytes(b"invalid")
+    with pytest.raises(duckdb.IOException, match="Failed to open LMDB environment"):
+        duckdb.execute("SELECT count(*) FROM hft_ob(?, ?)", [str(path_invalid), HFT_KEY])
+
+
+def test_hft_ob_rejects_invalid_lmdb_value(tmp_path):
+    path_action = tmp_path / "invalid-value-bin"
+    env = lmdb.Environment(str(path_action), subdir=False, map_size=1024 * 1024)
+    with env.begin(write=True) as txn:
+        txn.put(struct.pack("=i", HFT_KEY), b"invalid")
+    env.close()
+
+    with pytest.raises(duckdb.InvalidInputException, match="Invalid HFT action value"):
+        duckdb.execute("SELECT count(*) FROM hft_ob(?, ?)", [str(path_action), HFT_KEY])
+
+
+@pytest.mark.parametrize("parameters", [[None, HFT_KEY], ["unused", None]])
+def test_hft_ob_rejects_null_parameters(parameters):
+    with pytest.raises(duckdb.BinderException, match="filename and key cannot be NULL"):
+        duckdb.execute("SELECT count(*) FROM hft_ob(?, ?)", parameters)
 
 
 @pytest.mark.parametrize(

@@ -2,6 +2,18 @@ cmake_minimum_required(VERSION 3.29)
 
 project(duckdb_py LANGUAGES CXX)
 
+set(HFT_ENV_ROOT "" CACHE PATH "Path to the external hft-env checkout")
+if(NOT HFT_ENV_ROOT)
+  message(FATAL_ERROR "HFT_ENV_ROOT is required to build the twn extension")
+endif()
+set(HFT_LIBRARY_DIR "${HFT_ENV_ROOT}/hft/lib")
+if(NOT EXISTS "${HFT_ENV_ROOT}/hft/include/hft.h")
+  message(FATAL_ERROR "Missing ${HFT_ENV_ROOT}/hft/include/hft.h")
+endif()
+if(NOT EXISTS "${HFT_LIBRARY_DIR}/libhft.so")
+  message(FATAL_ERROR "Missing ${HFT_LIBRARY_DIR}/libhft.so")
+endif()
+
 # Always use C++11
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -92,6 +104,11 @@ pybind11_add_module(
 # add _duckdb_dependencies
 target_link_libraries(_duckdb PRIVATE _duckdb_dependencies)
 duckdb_link_extensions(_duckdb)
+target_link_libraries(_duckdb PRIVATE hft_external)
+set_target_properties(
+  _duckdb
+  PROPERTIES BUILD_RPATH "${HFT_LIBRARY_DIR}"
+             INSTALL_RPATH "${HFT_LIBRARY_DIR}")
 
 # ────────────────────────────────────────────
 # Put the object file in the correct place

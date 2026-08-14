@@ -5,10 +5,41 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 
+#include "lmdb.h"
+
 #include <algorithm>
 #include <cstring>
 
+extern "C" {
+int c_database_n(size_t value_size);
+void c_orderbook_delete(void *orderbook);
+void c_orderbook_extract(void *orderbook, const void *actions, int count, float *output);
+const char *c_sources();
+}
+
 namespace duckdb {
+
+// GPT-5: 大小来自当前 libhft C ABI，并由完整矩阵对拍防止静默漂移。
+constexpr idx_t HFT_ACTION_SIZE = 24;
+constexpr idx_t HFT_ORDERBOOK_SIZE = 184;
+static_assert(sizeof(void *) == 8, "hft_ob requires a 64-bit libhft ABI");
+
+static vector<string> HftSources() {
+	auto source_csv = string(c_sources());
+	if (source_csv.empty() || source_csv.back() != ',') {
+		throw InvalidInputException("Invalid source list returned by libhft");
+	}
+	vector<string> sources;
+	idx_t begin = 0;
+	for (idx_t index = 0; index < source_csv.size(); index++) {
+		if (source_csv[index] != ',') {
+			continue;
+		}
+		sources.emplace_back(source_csv.substr(begin, index - begin));
+		begin = index + 1;
+	}
+	return sources;
+}
 
 enum class TwnColumnKind : uint8_t {
 	INT8,
@@ -69,6 +100,125 @@ struct TwnScanGlobalState : public GlobalTableFunctionState {
 	vector<column_t> column_ids;
 	idx_t record_offset;
 	vector<data_t> buffer;
+};
+
+class HftLmdbValue {
+public:
+	HftLmdbValue(const string &path_p, int32_t key_p)
+	    : path(path_p), key(key_p), env(nullptr), txn(nullptr), action_count(0), actions(nullptr) {
+		Check("create LMDB environment", mdb_env_create(&env));
+		Check("open LMDB environment",
+		      mdb_env_open(env, path.c_str(), MDB_RDONLY | MDB_NOSUBDIR | MDB_NOLOCK | MDB_NORDAHEAD, 0444));
+		Check("begin LMDB transaction", mdb_txn_begin(env, nullptr, MDB_RDONLY, &txn));
+
+		MDB_dbi dbi;
+		Check("open LMDB database", mdb_dbi_open(txn, nullptr, 0, &dbi));
+		MDB_val key_value {sizeof(key), &key};
+		MDB_val value;
+		auto rc = mdb_get(txn, dbi, &key_value, &value);
+		if (rc == MDB_NOTFOUND) {
+			Close();
+			throw IOException("HFT action key %d not found in '%s'", key, path);
+		}
+		Check("read LMDB value", rc);
+
+		int count;
+		try {
+			count = c_database_n(value.mv_size);
+		} catch (int) {
+			Close();
+			throw InvalidInputException("Invalid HFT action value for key %d in '%s'", key, path);
+		}
+		if (count < 0 || NumericCast<idx_t>(count) > value.mv_size / HFT_ACTION_SIZE) {
+			Close();
+			throw InvalidInputException("Invalid HFT action value for key %d in '%s'", key, path);
+		}
+		action_count = NumericCast<idx_t>(count);
+		actions = static_cast<const_data_ptr_t>(value.mv_data) + value.mv_size - action_count * HFT_ACTION_SIZE;
+	}
+
+	~HftLmdbValue() {
+		Close();
+	}
+
+	idx_t Count() const {
+		return action_count;
+	}
+
+	const_data_ptr_t Action(idx_t index) const {
+		return actions + index * HFT_ACTION_SIZE;
+	}
+
+private:
+	void Check(const char *operation, int rc) {
+		if (!rc) {
+			return;
+		}
+		auto message = string(mdb_strerror(rc));
+		Close();
+		throw IOException("Failed to %s for HFT ACTION-bin '%s': %s", operation, path, message);
+	}
+
+	void Close() {
+		if (txn) {
+			mdb_txn_abort(txn);
+			txn = nullptr;
+		}
+		if (env) {
+			mdb_env_close(env);
+			env = nullptr;
+		}
+	}
+
+	string path;
+	int32_t key;
+	MDB_env *env;
+	MDB_txn *txn;
+	idx_t action_count;
+	const_data_ptr_t actions;
+};
+
+struct HftOrderbookState {
+	HftOrderbookState() : bytes {} {
+	}
+
+	~HftOrderbookState() {
+		c_orderbook_delete(bytes);
+	}
+
+	alignas(8) data_t bytes[HFT_ORDERBOOK_SIZE];
+};
+
+struct HftObBindData : public TableFunctionData {
+	HftObBindData(string path_p, int32_t key_p, idx_t action_count_p, idx_t source_count_p)
+	    : path(std::move(path_p)), key(key_p), action_count(action_count_p), source_count(source_count_p) {
+	}
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<HftObBindData>(path, key, action_count, source_count);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<HftObBindData>();
+		return path == other.path && key == other.key && action_count == other.action_count &&
+		       source_count == other.source_count;
+	}
+
+	string path;
+	int32_t key;
+	idx_t action_count;
+	idx_t source_count;
+};
+
+struct HftObGlobalState : public GlobalTableFunctionState {
+	HftObGlobalState(const string &path, int32_t key, vector<column_t> column_ids_p)
+	    : value(path, key), column_ids(std::move(column_ids_p)), action_offset(0) {
+	}
+
+	HftLmdbValue value;
+	HftOrderbookState orderbook;
+	vector<column_t> column_ids;
+	idx_t action_offset;
 };
 
 static vector<TwnColumnDefinition> DecisionColumns() {
@@ -326,6 +476,60 @@ static void TwnScan(ClientContext &context, TableFunctionInput &input, DataChunk
 	output.SetCardinality(count);
 }
 
+static unique_ptr<FunctionData> HftObBind(ClientContext &context, TableFunctionBindInput &input,
+                                          vector<LogicalType> &return_types, vector<string> &names) {
+	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+		throw BinderException("hft_ob filename and key cannot be NULL");
+	}
+	auto path = StringValue::Get(input.inputs[0]);
+	auto key = input.inputs[1].GetValue<int32_t>();
+	HftLmdbValue value(path, key);
+	auto sources = HftSources();
+	for (auto &source : sources) {
+		names.emplace_back(source);
+		return_types.emplace_back(LogicalType::FLOAT);
+	}
+	return make_uniq<HftObBindData>(std::move(path), key, value.Count(), sources.size());
+}
+
+static unique_ptr<GlobalTableFunctionState> HftObInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<HftObBindData>();
+	return make_uniq<HftObGlobalState>(bind_data.path, bind_data.key, input.column_ids);
+}
+
+static unique_ptr<NodeStatistics> HftObCardinality(ClientContext &context, const FunctionData *bind_data_p) {
+	auto &bind_data = bind_data_p->Cast<HftObBindData>();
+	return make_uniq<NodeStatistics>(bind_data.action_count, bind_data.action_count);
+}
+
+static void HftObScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &bind_data = input.bind_data->Cast<HftObBindData>();
+	auto &state = input.global_state->Cast<HftObGlobalState>();
+	if (state.action_offset >= bind_data.action_count) {
+		return;
+	}
+	auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, bind_data.action_count - state.action_offset);
+	if (!state.column_ids.empty()) {
+		vector<float> source_values(bind_data.source_count);
+		for (idx_t row = 0; row < count; row++) {
+			c_orderbook_extract(state.orderbook.bytes, state.value.Action(state.action_offset + row), 1,
+			                    source_values.data());
+			for (idx_t output_column = 0; output_column < state.column_ids.size(); output_column++) {
+				auto column_id = state.column_ids[output_column];
+				if (column_id == COLUMN_IDENTIFIER_ROW_ID) {
+					FlatVector::GetData<int64_t>(output.data[output_column])[row] =
+					    NumericCast<int64_t>(state.action_offset + row);
+					continue;
+				}
+				FlatVector::GetData<float>(output.data[output_column])[row] =
+				    source_values[NumericCast<idx_t>(column_id)];
+			}
+		}
+	}
+	state.action_offset += count;
+	output.SetCardinality(count);
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction read_decision("read_twn_decision", {LogicalType::VARCHAR}, TwnScan, TwnDecisionBind, TwnScanInit);
 	read_decision.projection_pushdown = true;
@@ -334,6 +538,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction read_execution("read_twn_execution", {LogicalType::VARCHAR}, TwnScan, TwnExecutionBind, TwnScanInit);
 	read_execution.projection_pushdown = true;
 	loader.RegisterFunction(read_execution);
+
+	TableFunction hft_ob("hft_ob", {LogicalType::VARCHAR, LogicalType::INTEGER}, HftObScan, HftObBind, HftObInit);
+	hft_ob.projection_pushdown = true;
+	hft_ob.cardinality = HftObCardinality;
+	loader.RegisterFunction(hft_ob);
 }
 
 void TwnExtension::Load(ExtensionLoader &loader) {
