@@ -6,6 +6,8 @@ files as DuckDB table functions:
 ```sql
 SELECT * FROM read_twn_decision('/path/to/decision-bin');
 SELECT * FROM read_twn_execution('/path/to/execution-bin');
+SELECT * FROM read_twn_decision('2026-08-11:2026-08-13');
+SELECT * FROM read_twn_execution('2026-08-11:2026-08-13');
 SELECT * FROM hft_ob('/path/to/ACTION-bin', 1304989);
 SELECT * FROM hft_ob('/path/to/ACTION-bin');
 SELECT * FROM hft_ob('/path/to/ACTION-bin') WHERE key = 1304989;
@@ -17,6 +19,16 @@ whose sizes are not record-aligned. Fixed-size character buffers are returned
 as `VARCHAR` with trailing NUL bytes removed. The Format6 body is a `BLOB`,
 orderbook levels are `INTEGER[10]`, and decision `state` and `hidden` are
 `FLOAT[]` truncated to their persisted `state_size` and `hidden_size`.
+
+An ISO date argument reads that day's matching file. An inclusive
+`YYYY-MM-DD:YYYY-MM-DD` range expands to one file per existing date under
+`PERSIST_ROOT`, or `/home/hft/post/prod/twn/persist` when that environment
+variable is unset or empty. Missing dates inside a range are skipped so that
+weekends and holidays do not fail the query; a single missing date and a range
+with no matching files are errors. Each day is an independent DuckDB scan task,
+so a multi-day query can use up to `min(days_with_files, threads)` threads.
+Parallel result order is unspecified; use `ORDER BY` whenever row order matters.
+Exact filename arguments remain backward compatible.
 
 The extension uses projection pushdown, so queries only decode requested
 columns. In particular, `count(*)` does not materialize the large decision

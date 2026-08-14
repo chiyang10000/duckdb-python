@@ -14,9 +14,9 @@ EXECUTION_RECORD_SIZE = 304
 HFT_KEY = 1304989
 
 
-def write_decision(path):
+def write_decision(path, local_time_ns=1000000001, key=1234):
     record = bytearray(DECISION_RECORD_SIZE)
-    struct.pack_into("<qiiiii", record, 0, 1000000001, 7, 11, 1234, 2, 1)
+    struct.pack_into("<qiiiii", record, 0, local_time_ns, 7, 11, key, 2, 1)
     struct.pack_into("<B", record, 32, 1)
     struct.pack_into("<i", record, 36, 2)
     struct.pack_into("<B", record, 40, 3)
@@ -126,6 +126,61 @@ def test_read_twn_execution(tmp_path):
         (100, 1234, "3", "A1", "2330", "first"),
         (200, 5678, "3", "B2", "2330", "second"),
     ]
+
+
+def test_read_twn_date_range_uses_persist_root_and_skips_missing_dates(tmp_path, monkeypatch):
+    dir_persist = tmp_path / "persist"
+    dir_date_0 = dir_persist / "2026-08-10"
+    dir_date_2 = dir_persist / "2026-08-12"
+    dir_date_0.mkdir(parents=True)
+    dir_date_2.mkdir(parents=True)
+    write_decision(dir_date_0 / "decision-bin", local_time_ns=100, key=10)
+    write_decision(dir_date_2 / "decision-bin", local_time_ns=300, key=30)
+    (dir_date_0 / "execution-bin").write_bytes(
+        execution_record(100, 10, b"A1", b"date-0-a") + execution_record(200, 20, b"A2", b"date-0-b")
+    )
+    (dir_date_2 / "execution-bin").write_bytes(execution_record(300, 30, b"C1", b"date-2"))
+    monkeypatch.setenv("PERSIST_ROOT", str(dir_persist))
+
+    connection = duckdb.connect(config={"threads": 4})
+    l_decision = connection.execute(
+        """
+        SELECT local_time_ns, key
+        FROM read_twn_decision('2026-08-10:2026-08-12')
+        ORDER BY local_time_ns
+        """
+    ).fetchall()
+    l_execution = connection.execute(
+        """
+        SELECT local_time_ns, key, text
+        FROM read_twn_execution('2026-08-10:2026-08-12')
+        ORDER BY local_time_ns
+        """
+    ).fetchall()
+
+    assert l_decision == [(100, 10), (300, 30)]
+    assert l_execution == [(100, 10, "date-0-a"), (200, 20, "date-0-b"), (300, 30, "date-2")]
+    assert connection.execute("SELECT count(*) FROM read_twn_execution('2026-08-10')").fetchone() == (2,)
+
+
+@pytest.mark.parametrize("function_name", ["read_twn_decision", "read_twn_execution"])
+def test_read_twn_date_range_errors(tmp_path, monkeypatch, function_name):
+    dir_persist = tmp_path / "persist"
+    dir_persist.mkdir()
+    monkeypatch.setenv("PERSIST_ROOT", str(dir_persist))
+
+    with pytest.raises(duckdb.BinderException, match="start .* is after end"):
+        duckdb.execute(f"SELECT count(*) FROM {function_name}('2026-08-12:2026-08-10')")
+    with pytest.raises(duckdb.IOException, match="No TWN persist .* files found"):
+        duckdb.execute(f"SELECT count(*) FROM {function_name}('2026-08-10:2026-08-12')")
+    with pytest.raises(duckdb.IOException, match="Cannot open file"):
+        duckdb.execute(f"SELECT count(*) FROM {function_name}('2026-08-10')")
+
+
+@pytest.mark.parametrize("function_name", ["read_twn_decision", "read_twn_execution"])
+def test_read_twn_rejects_null_date_or_filename(function_name):
+    with pytest.raises(duckdb.BinderException, match="filename or date range cannot be NULL"):
+        duckdb.execute(f"SELECT count(*) FROM {function_name}(NULL)")
 
 
 def test_hft_ob_matches_hft_extract(tmp_path):

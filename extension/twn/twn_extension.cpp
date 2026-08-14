@@ -2,8 +2,10 @@
 
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/helper.hpp"
+#include "duckdb/common/types/date.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
@@ -13,6 +15,7 @@
 #include "lmdb.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 extern "C" {
@@ -75,34 +78,73 @@ struct TwnColumnDefinition {
 	idx_t length_offset;
 };
 
+struct TwnScanFile {
+	TwnScanFile(string path_p, idx_t record_count_p) : path(std::move(path_p)), record_count(record_count_p) {
+	}
+
+	string path;
+	idx_t record_count;
+};
+
 struct TwnScanBindData : public TableFunctionData {
-	TwnScanBindData(string path_p, idx_t record_size_p, idx_t record_count_p, vector<TwnColumnDefinition> columns_p)
-	    : path(std::move(path_p)), record_size(record_size_p), record_count(record_count_p),
+	TwnScanBindData(vector<TwnScanFile> files_p, idx_t record_size_p, idx_t record_count_p,
+	                vector<TwnColumnDefinition> columns_p)
+	    : files(std::move(files_p)), record_size(record_size_p), record_count(record_count_p),
 	      columns(std::move(columns_p)) {
 	}
 
 	unique_ptr<FunctionData> Copy() const override {
-		return make_uniq<TwnScanBindData>(path, record_size, record_count, columns);
+		return make_uniq<TwnScanBindData>(files, record_size, record_count, columns);
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<TwnScanBindData>();
-		return path == other.path && record_size == other.record_size && record_count == other.record_count;
+		if (record_size != other.record_size || record_count != other.record_count ||
+		    files.size() != other.files.size()) {
+			return false;
+		}
+		for (idx_t index = 0; index < files.size(); index++) {
+			if (files[index].path != other.files[index].path ||
+			    files[index].record_count != other.files[index].record_count) {
+				return false;
+			}
+		}
+		return true;
 	}
 
-	string path;
+	vector<TwnScanFile> files;
 	idx_t record_size;
 	idx_t record_count;
 	vector<TwnColumnDefinition> columns;
 };
 
 struct TwnScanGlobalState : public GlobalTableFunctionState {
-	TwnScanGlobalState(unique_ptr<FileHandle> handle_p, vector<column_t> column_ids_p)
-	    : handle(std::move(handle_p)), column_ids(std::move(column_ids_p)), record_offset(0) {
+	TwnScanGlobalState(idx_t file_count, ClientContext &context) : next_file(0) {
+		max_threads = MinValue(file_count, NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads()));
+	}
+
+	idx_t MaxThreads() const override {
+		return max_threads;
+	}
+
+	idx_t NextFile() {
+		lock_guard<mutex> guard(lock);
+		return next_file++;
+	}
+
+	idx_t max_threads;
+	mutex lock;
+	idx_t next_file;
+};
+
+struct TwnScanLocalState : public LocalTableFunctionState {
+	explicit TwnScanLocalState(vector<column_t> column_ids_p)
+	    : column_ids(std::move(column_ids_p)), file_index(DConstants::INVALID_INDEX), record_offset(0) {
 	}
 
 	unique_ptr<FileHandle> handle;
 	vector<column_t> column_ids;
+	idx_t file_index;
 	idx_t record_offset;
 	vector<data_t> buffer;
 };
@@ -574,42 +616,112 @@ static vector<TwnColumnDefinition> ExecutionColumns() {
 	return columns;
 }
 
-static unique_ptr<FunctionData> TwnScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                            vector<LogicalType> &return_types, vector<string> &names, idx_t record_size,
-                                            vector<TwnColumnDefinition> columns) {
-	if (input.inputs[0].IsNull()) {
-		throw BinderException("TWN persist filename cannot be NULL");
+static bool IsIsoDate(const string &input) {
+	if (input.size() != 10 || input[4] != '-' || input[7] != '-') {
+		return false;
 	}
-	auto path = StringValue::Get(input.inputs[0]);
-	auto &file_system = FileSystem::GetFileSystem(context);
+	for (idx_t index = 0; index < input.size(); index++) {
+		if (index == 4 || index == 7) {
+			continue;
+		}
+		if (input[index] < '0' || input[index] > '9') {
+			return false;
+		}
+	}
+	return true;
+}
+
+static string TwnPersistRoot() {
+	auto configured_root = std::getenv("PERSIST_ROOT");
+	if (configured_root && configured_root[0]) {
+		return configured_root;
+	}
+	return "/home/hft/post/prod/twn/persist";
+}
+
+static TwnScanFile TwnInspectFile(FileSystem &file_system, const string &path, idx_t record_size) {
 	auto handle = file_system.OpenFile(path, FileFlags::FILE_FLAGS_READ);
 	auto file_size = handle->GetFileSize();
 	if (file_size % record_size != 0) {
 		throw InvalidInputException("TWN persist file '%s' has size %llu, which is not aligned to %llu-byte records",
 		                            path, file_size, record_size);
 	}
+	return TwnScanFile(path, file_size / record_size);
+}
+
+static vector<TwnScanFile> TwnResolveFiles(FileSystem &file_system, const string &input, const string &filename,
+                                           idx_t record_size) {
+	vector<TwnScanFile> files;
+	auto separator = input.find(':');
+	if (separator == string::npos && IsIsoDate(input)) {
+		auto date = Date::FromString(input, true);
+		auto path = file_system.JoinPath(TwnPersistRoot(), Date::ToString(date), filename);
+		files.emplace_back(TwnInspectFile(file_system, path, record_size));
+		return files;
+	}
+	if (separator == 10 && input.size() == 21 && IsIsoDate(input.substr(0, separator)) &&
+	    IsIsoDate(input.substr(separator + 1))) {
+		auto start = Date::FromString(input.substr(0, separator), true);
+		auto end = Date::FromString(input.substr(separator + 1), true);
+		if (start > end) {
+			throw BinderException("TWN persist date range start '%s' is after end '%s'", Date::ToString(start),
+			                      Date::ToString(end));
+		}
+		auto persist_root = TwnPersistRoot();
+		for (auto date = start; date <= end; date += 1) {
+			auto path = file_system.JoinPath(persist_root, Date::ToString(date), filename);
+			if (file_system.FileExists(path)) {
+				files.emplace_back(TwnInspectFile(file_system, path, record_size));
+			}
+		}
+		if (files.empty()) {
+			throw IOException("No TWN persist '%s' files found in date range '%s' under '%s'", filename, input,
+			                  persist_root);
+		}
+		return files;
+	}
+	files.emplace_back(TwnInspectFile(file_system, input, record_size));
+	return files;
+}
+
+static unique_ptr<FunctionData> TwnScanBind(ClientContext &context, TableFunctionBindInput &input,
+                                            vector<LogicalType> &return_types, vector<string> &names, idx_t record_size,
+                                            const string &filename, vector<TwnColumnDefinition> columns) {
+	if (input.inputs[0].IsNull()) {
+		throw BinderException("TWN persist filename or date range cannot be NULL");
+	}
+	auto input_path = StringValue::Get(input.inputs[0]);
+	auto &file_system = FileSystem::GetFileSystem(context);
+	auto files = TwnResolveFiles(file_system, input_path, filename, record_size);
+	idx_t record_count = 0;
+	for (auto &file : files) {
+		record_count += file.record_count;
+	}
 	for (auto &column : columns) {
 		names.emplace_back(column.name);
 		return_types.emplace_back(column.type);
 	}
-	return make_uniq<TwnScanBindData>(std::move(path), record_size, file_size / record_size, std::move(columns));
+	return make_uniq<TwnScanBindData>(std::move(files), record_size, record_count, std::move(columns));
 }
 
 static unique_ptr<FunctionData> TwnDecisionBind(ClientContext &context, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<string> &names) {
-	return TwnScanBind(context, input, return_types, names, 8712, DecisionColumns());
+	return TwnScanBind(context, input, return_types, names, 8712, "decision-bin", DecisionColumns());
 }
 
 static unique_ptr<FunctionData> TwnExecutionBind(ClientContext &context, TableFunctionBindInput &input,
                                                  vector<LogicalType> &return_types, vector<string> &names) {
-	return TwnScanBind(context, input, return_types, names, 304, ExecutionColumns());
+	return TwnScanBind(context, input, return_types, names, 304, "execution-bin", ExecutionColumns());
 }
 
 static unique_ptr<GlobalTableFunctionState> TwnScanInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<TwnScanBindData>();
-	auto &file_system = FileSystem::GetFileSystem(context);
-	auto handle = file_system.OpenFile(bind_data.path, FileFlags::FILE_FLAGS_READ);
-	return make_uniq<TwnScanGlobalState>(std::move(handle), input.column_ids);
+	return make_uniq<TwnScanGlobalState>(bind_data.files.size(), context);
+}
+
+static unique_ptr<LocalTableFunctionState> TwnScanInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+                                                            GlobalTableFunctionState *global_state) {
+	return make_uniq<TwnScanLocalState>(input.column_ids);
 }
 
 template <class T>
@@ -699,27 +811,37 @@ static void SetColumn(Vector &output, idx_t row, const TwnColumnDefinition &colu
 
 static void TwnScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &bind_data = input.bind_data->Cast<TwnScanBindData>();
-	auto &state = input.global_state->Cast<TwnScanGlobalState>();
-	if (state.record_offset >= bind_data.record_count) {
-		return;
+	auto &global_state = input.global_state->Cast<TwnScanGlobalState>();
+	auto &local_state = input.local_state->Cast<TwnScanLocalState>();
+	auto &file_system = FileSystem::GetFileSystem(context);
+	while (!local_state.handle || local_state.record_offset >= bind_data.files[local_state.file_index].record_count) {
+		auto file_index = global_state.NextFile();
+		if (file_index >= bind_data.files.size()) {
+			return;
+		}
+		local_state.file_index = file_index;
+		local_state.record_offset = 0;
+		local_state.handle = file_system.OpenFile(bind_data.files[file_index].path, FileFlags::FILE_FLAGS_READ);
 	}
-	auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, bind_data.record_count - state.record_offset);
-	if (!state.column_ids.empty()) {
-		state.buffer.resize(count * bind_data.record_size);
-		state.handle->Read(state.buffer.data(), state.buffer.size(), state.record_offset * bind_data.record_size);
-		for (idx_t output_column = 0; output_column < state.column_ids.size(); output_column++) {
-			auto column_id = state.column_ids[output_column];
+	auto &file = bind_data.files[local_state.file_index];
+	auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, file.record_count - local_state.record_offset);
+	if (!local_state.column_ids.empty()) {
+		local_state.buffer.resize(count * bind_data.record_size);
+		local_state.handle->Read(local_state.buffer.data(), local_state.buffer.size(),
+		                         local_state.record_offset * bind_data.record_size);
+		for (idx_t output_column = 0; output_column < local_state.column_ids.size(); output_column++) {
+			auto column_id = local_state.column_ids[output_column];
 			if (column_id == COLUMN_IDENTIFIER_ROW_ID) {
 				continue;
 			}
 			auto &column = bind_data.columns[NumericCast<idx_t>(column_id)];
 			for (idx_t row = 0; row < count; row++) {
-				auto record = state.buffer.data() + row * bind_data.record_size;
+				auto record = local_state.buffer.data() + row * bind_data.record_size;
 				SetColumn(output.data[output_column], row, column, record);
 			}
 		}
 	}
-	state.record_offset += count;
+	local_state.record_offset += count;
 	output.SetCardinality(count);
 }
 
@@ -877,11 +999,13 @@ static void HftObAllScan(ClientContext &context, TableFunctionInput &input, Data
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	TableFunction read_decision("read_twn_decision", {LogicalType::VARCHAR}, TwnScan, TwnDecisionBind, TwnScanInit);
+	TableFunction read_decision("read_twn_decision", {LogicalType::VARCHAR}, TwnScan, TwnDecisionBind, TwnScanInit,
+	                            TwnScanInitLocal);
 	read_decision.projection_pushdown = true;
 	loader.RegisterFunction(read_decision);
 
-	TableFunction read_execution("read_twn_execution", {LogicalType::VARCHAR}, TwnScan, TwnExecutionBind, TwnScanInit);
+	TableFunction read_execution("read_twn_execution", {LogicalType::VARCHAR}, TwnScan, TwnExecutionBind, TwnScanInit,
+	                             TwnScanInitLocal);
 	read_execution.projection_pushdown = true;
 	loader.RegisterFunction(read_execution);
 
