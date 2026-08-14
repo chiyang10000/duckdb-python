@@ -4,6 +4,11 @@
 #include "duckdb/common/helper.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
+#include "duckdb/planner/table_filter.hpp"
 
 #include "lmdb.h"
 
@@ -186,6 +191,11 @@ struct HftOrderbookState {
 		c_orderbook_delete(bytes);
 	}
 
+	void Reset() {
+		c_orderbook_delete(bytes);
+		std::memset(bytes, 0, sizeof(bytes));
+	}
+
 	alignas(8) data_t bytes[HFT_ORDERBOOK_SIZE];
 };
 
@@ -219,6 +229,243 @@ struct HftObGlobalState : public GlobalTableFunctionState {
 	HftOrderbookState orderbook;
 	vector<column_t> column_ids;
 	idx_t action_offset;
+};
+
+static bool HftKeyMatchesFilter(int32_t key, const TableFilter &filter) {
+	auto key_value = Value::INTEGER(key);
+	switch (filter.filter_type) {
+	case TableFilterType::CONSTANT_COMPARISON:
+		return filter.Cast<ConstantFilter>().Compare(key_value);
+	case TableFilterType::IS_NULL:
+		return false;
+	case TableFilterType::IS_NOT_NULL:
+		return true;
+	case TableFilterType::CONJUNCTION_AND: {
+		auto &conjunction = filter.Cast<ConjunctionAndFilter>();
+		for (auto &child : conjunction.child_filters) {
+			if (!HftKeyMatchesFilter(key, *child)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	case TableFilterType::CONJUNCTION_OR: {
+		auto &conjunction = filter.Cast<ConjunctionOrFilter>();
+		for (auto &child : conjunction.child_filters) {
+			if (HftKeyMatchesFilter(key, *child)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case TableFilterType::IN_FILTER: {
+		auto &in_filter = filter.Cast<InFilter>();
+		for (auto &value : in_filter.values) {
+			if (Value::DefaultValuesAreEqual(key_value, value)) {
+				return true;
+			}
+		}
+		return false;
+	}
+	case TableFilterType::OPTIONAL_FILTER:
+	case TableFilterType::DYNAMIC_FILTER:
+	case TableFilterType::BLOOM_FILTER:
+		// GPT-5.6: optional/dynamic filter 只是 scan hint，忽略它们仍保持 SQL 结果正确。
+		return true;
+	default:
+		throw InternalException("Unsupported hft_ob key filter type");
+	}
+}
+
+static bool HftKeyEquality(const TableFilter &filter, int32_t &key) {
+	if (filter.filter_type == TableFilterType::CONSTANT_COMPARISON) {
+		auto &constant = filter.Cast<ConstantFilter>();
+		if (constant.comparison_type != ExpressionType::COMPARE_EQUAL) {
+			return false;
+		}
+		key = constant.constant.GetValue<int32_t>();
+		return true;
+	}
+	if (filter.filter_type != TableFilterType::CONJUNCTION_AND) {
+		return false;
+	}
+	auto &conjunction = filter.Cast<ConjunctionAndFilter>();
+	for (auto &child : conjunction.child_filters) {
+		if (HftKeyEquality(*child, key)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+class HftLmdbCursor {
+public:
+	explicit HftLmdbCursor(const string &path_p)
+	    : path(path_p), env(nullptr), txn(nullptr), cursor(nullptr), action_count(0), actions(nullptr), key(0) {
+		Check("create LMDB environment", mdb_env_create(&env));
+		Check("open LMDB environment",
+		      mdb_env_open(env, path.c_str(), MDB_RDONLY | MDB_NOSUBDIR | MDB_NOLOCK | MDB_NORDAHEAD, 0444));
+		Check("begin LMDB transaction", mdb_txn_begin(env, nullptr, MDB_RDONLY, &txn));
+		Check("open LMDB database", mdb_dbi_open(txn, nullptr, 0, &dbi));
+	}
+
+	~HftLmdbCursor() {
+		Close();
+	}
+
+	bool Get(int32_t exact_key, const TableFilter *filter) {
+		MDB_val key_value {sizeof(exact_key), &exact_key};
+		MDB_val value;
+		auto rc = mdb_get(txn, dbi, &key_value, &value);
+		if (rc == MDB_NOTFOUND) {
+			return false;
+		}
+		Check("read LMDB value", rc);
+		return Load(key_value, value, filter);
+	}
+
+	bool First(const TableFilter *filter) {
+		if (!cursor) {
+			Check("open LMDB cursor", mdb_cursor_open(txn, dbi, &cursor));
+		}
+		return Move(MDB_FIRST, filter);
+	}
+
+	bool Next(const TableFilter *filter) {
+		return Move(MDB_NEXT, filter);
+	}
+
+	int32_t Key() const {
+		return key;
+	}
+
+	idx_t Count() const {
+		return action_count;
+	}
+
+	const_data_ptr_t Action(idx_t index) const {
+		return actions + index * HFT_ACTION_SIZE;
+	}
+
+private:
+	bool Move(MDB_cursor_op operation, const TableFilter *filter) {
+		MDB_val key_value;
+		MDB_val value;
+		auto rc = mdb_cursor_get(cursor, &key_value, &value, operation);
+		while (rc == 0) {
+			if (Load(key_value, value, filter)) {
+				return true;
+			}
+			rc = mdb_cursor_get(cursor, &key_value, &value, MDB_NEXT);
+		}
+		if (rc != MDB_NOTFOUND) {
+			Check("advance LMDB cursor", rc);
+		}
+		return false;
+	}
+
+	bool Load(const MDB_val &key_value, const MDB_val &value, const TableFilter *filter) {
+		if (key_value.mv_size != sizeof(key)) {
+			throw InvalidInputException("Invalid HFT action key size %llu in '%s'", key_value.mv_size, path);
+		}
+		std::memcpy(&key, key_value.mv_data, sizeof(key));
+		if (filter && !HftKeyMatchesFilter(key, *filter)) {
+			return false;
+		}
+
+		int count;
+		try {
+			count = c_database_n(value.mv_size);
+		} catch (int) {
+			throw InvalidInputException("Invalid HFT action value for key %d in '%s'", key, path);
+		}
+		if (count < 0 || NumericCast<idx_t>(count) > value.mv_size / HFT_ACTION_SIZE) {
+			throw InvalidInputException("Invalid HFT action value for key %d in '%s'", key, path);
+		}
+		action_count = NumericCast<idx_t>(count);
+		actions = static_cast<const_data_ptr_t>(value.mv_data) + value.mv_size - action_count * HFT_ACTION_SIZE;
+		return action_count != 0;
+	}
+
+	void Check(const char *operation, int rc) {
+		if (!rc) {
+			return;
+		}
+		auto message = string(mdb_strerror(rc));
+		Close();
+		throw IOException("Failed to %s for HFT ACTION-bin '%s': %s", operation, path, message);
+	}
+
+	void Close() {
+		if (cursor) {
+			mdb_cursor_close(cursor);
+			cursor = nullptr;
+		}
+		if (txn) {
+			mdb_txn_abort(txn);
+			txn = nullptr;
+		}
+		if (env) {
+			mdb_env_close(env);
+			env = nullptr;
+		}
+	}
+
+	string path;
+	MDB_env *env;
+	MDB_txn *txn;
+	MDB_dbi dbi;
+	MDB_cursor *cursor;
+	idx_t action_count;
+	const_data_ptr_t actions;
+	int32_t key;
+};
+
+struct HftObAllBindData : public TableFunctionData {
+	HftObAllBindData(string path_p, idx_t source_count_p) : path(std::move(path_p)), source_count(source_count_p) {
+	}
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<HftObAllBindData>(path, source_count);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<HftObAllBindData>();
+		return path == other.path && source_count == other.source_count;
+	}
+
+	string path;
+	idx_t source_count;
+};
+
+struct HftObAllGlobalState : public GlobalTableFunctionState {
+	HftObAllGlobalState(const string &path, vector<column_t> column_ids_p, unique_ptr<TableFilter> key_filter_p)
+	    : key_filter(std::move(key_filter_p)), cursor(path), column_ids(std::move(column_ids_p)), action_offset(0),
+	      row_offset(0), is_exact(false), has_value(false) {
+		int32_t exact_key;
+		if (key_filter && HftKeyEquality(*key_filter, exact_key)) {
+			is_exact = true;
+			has_value = cursor.Get(exact_key, key_filter.get());
+		} else {
+			has_value = cursor.First(key_filter.get());
+		}
+	}
+
+	bool NextKey() {
+		orderbook.Reset();
+		action_offset = 0;
+		has_value = !is_exact && cursor.Next(key_filter.get());
+		return has_value;
+	}
+
+	unique_ptr<TableFilter> key_filter;
+	HftLmdbCursor cursor;
+	HftOrderbookState orderbook;
+	vector<column_t> column_ids;
+	idx_t action_offset;
+	idx_t row_offset;
+	bool is_exact;
+	bool has_value;
 };
 
 static vector<TwnColumnDefinition> DecisionColumns() {
@@ -530,6 +777,105 @@ static void HftObScan(ClientContext &context, TableFunctionInput &input, DataChu
 	output.SetCardinality(count);
 }
 
+static unique_ptr<FunctionData> HftObAllBind(ClientContext &context, TableFunctionBindInput &input,
+                                             vector<LogicalType> &return_types, vector<string> &names) {
+	if (input.inputs[0].IsNull()) {
+		throw BinderException("hft_ob filename cannot be NULL");
+	}
+	auto path = StringValue::Get(input.inputs[0]);
+	HftLmdbCursor database(path);
+	auto sources = HftSources();
+	names.emplace_back("key");
+	return_types.emplace_back(LogicalType::INTEGER);
+	for (auto &source : sources) {
+		names.emplace_back(source);
+		return_types.emplace_back(LogicalType::FLOAT);
+	}
+	return make_uniq<HftObAllBindData>(std::move(path), sources.size());
+}
+
+static unique_ptr<TableFilter> HftObAllKeyFilter(TableFunctionInitInput &input) {
+	if (!input.filters) {
+		return nullptr;
+	}
+	for (auto &entry : input.filters->filters) {
+		if (entry.first >= input.column_ids.size()) {
+			throw InternalException("hft_ob filter column is out of range");
+		}
+		if (input.column_ids[entry.first] == 0) {
+			return entry.second->Copy();
+		}
+	}
+	return nullptr;
+}
+
+static vector<column_t> HftObAllOutputColumns(TableFunctionInitInput &input) {
+	if (input.projection_ids.empty()) {
+		return input.column_ids;
+	}
+	vector<column_t> result;
+	result.reserve(input.projection_ids.size());
+	for (auto projection_id : input.projection_ids) {
+		result.push_back(input.column_ids[projection_id]);
+	}
+	return result;
+}
+
+static unique_ptr<GlobalTableFunctionState> HftObAllInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<HftObAllBindData>();
+	return make_uniq<HftObAllGlobalState>(bind_data.path, HftObAllOutputColumns(input), HftObAllKeyFilter(input));
+}
+
+static bool HftObAllSupportsPushdownType(const FunctionData &bind_data, idx_t column_index) {
+	return column_index == 0;
+}
+
+static void HftObAllScan(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+	auto &bind_data = input.bind_data->Cast<HftObAllBindData>();
+	auto &state = input.global_state->Cast<HftObAllGlobalState>();
+	idx_t output_count = 0;
+	bool needs_orderbook = false;
+	for (auto column_id : state.column_ids) {
+		if (column_id != 0 && column_id != COLUMN_IDENTIFIER_ROW_ID) {
+			needs_orderbook = true;
+			break;
+		}
+	}
+	vector<float> source_values;
+	if (needs_orderbook) {
+		source_values.resize(bind_data.source_count);
+	}
+
+	while (output_count < STANDARD_VECTOR_SIZE && state.has_value) {
+		auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE - output_count, state.cursor.Count() - state.action_offset);
+		for (idx_t row = 0; row < count; row++) {
+			if (needs_orderbook) {
+				c_orderbook_extract(state.orderbook.bytes, state.cursor.Action(state.action_offset + row), 1,
+				                    source_values.data());
+			}
+			for (idx_t output_column = 0; output_column < state.column_ids.size(); output_column++) {
+				auto column_id = state.column_ids[output_column];
+				if (column_id == COLUMN_IDENTIFIER_ROW_ID) {
+					FlatVector::GetData<int64_t>(output.data[output_column])[output_count + row] =
+					    NumericCast<int64_t>(state.row_offset + row);
+				} else if (column_id == 0) {
+					FlatVector::GetData<int32_t>(output.data[output_column])[output_count + row] = state.cursor.Key();
+				} else {
+					FlatVector::GetData<float>(output.data[output_column])[output_count + row] =
+					    source_values[NumericCast<idx_t>(column_id - 1)];
+				}
+			}
+		}
+		state.action_offset += count;
+		state.row_offset += count;
+		output_count += count;
+		if (state.action_offset == state.cursor.Count()) {
+			state.NextKey();
+		}
+	}
+	output.SetCardinality(output_count);
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction read_decision("read_twn_decision", {LogicalType::VARCHAR}, TwnScan, TwnDecisionBind, TwnScanInit);
 	read_decision.projection_pushdown = true;
@@ -539,10 +885,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 	read_execution.projection_pushdown = true;
 	loader.RegisterFunction(read_execution);
 
-	TableFunction hft_ob("hft_ob", {LogicalType::VARCHAR, LogicalType::INTEGER}, HftObScan, HftObBind, HftObInit);
-	hft_ob.projection_pushdown = true;
-	hft_ob.cardinality = HftObCardinality;
-	loader.RegisterFunction(hft_ob);
+	TableFunction hft_ob_key({LogicalType::VARCHAR, LogicalType::INTEGER}, HftObScan, HftObBind, HftObInit);
+	hft_ob_key.projection_pushdown = true;
+	hft_ob_key.cardinality = HftObCardinality;
+
+	TableFunction hft_ob_all({LogicalType::VARCHAR}, HftObAllScan, HftObAllBind, HftObAllInit);
+	hft_ob_all.projection_pushdown = true;
+	hft_ob_all.filter_pushdown = true;
+	hft_ob_all.filter_prune = true;
+	hft_ob_all.supports_pushdown_type = HftObAllSupportsPushdownType;
+
+	TableFunctionSet hft_ob("hft_ob");
+	hft_ob.AddFunction(std::move(hft_ob_key));
+	hft_ob.AddFunction(std::move(hft_ob_all));
+	loader.RegisterFunction(std::move(hft_ob));
 }
 
 void TwnExtension::Load(ExtensionLoader &loader) {

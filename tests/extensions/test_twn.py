@@ -59,11 +59,11 @@ def execution_record(local_time_ns, key, clord_id, text):
     return record
 
 
-def write_action_fixture(dir_action, key=HFT_KEY):
+def write_action_fixture(dir_action, key=HFT_KEY, price_shift=0):
     arr_action = np.zeros(4, dtype=hft_orderbook.ACTION_DTYPE)
     arr_action["side"] = [1, -1, 1, -1]
     arr_action["time"] = [1786580992000000000, 100, 100, 100]
-    arr_action["price"] = [100, 102, 102, 100]
+    arr_action["price"] = np.array([100, 102, 102, 100]) + price_shift
     arr_action["volume"] = [10, 20, 5, 3]
     hft_c.lib.c_database_write(
         str(dir_action).encode(),
@@ -145,6 +145,80 @@ def test_hft_ob_matches_hft_extract(tmp_path):
     assert connection.execute("SELECT count(*) FROM hft_ob(?, ?)", [str(path_action), HFT_KEY]).fetchone() == (4,)
 
 
+def test_hft_ob_all_keys_matches_hft_extract(tmp_path):
+    path_action, arr_action_1 = write_action_fixture(tmp_path)
+    _, arr_action_2 = write_action_fixture(tmp_path, HFT_KEY + 1, price_shift=20)
+
+    connection = duckdb.connect()
+    cursor = connection.execute("SELECT * FROM hft_ob(?) ORDER BY key, action_num", [str(path_action)])
+    list_column = [column[0] for column in cursor.description]
+    list_type = [str(column[1]) for column in cursor.description]
+    column2array = cursor.fetchnumpy()
+
+    assert list_column == ["key"] + hft_orderbook.sources
+    assert list_type == ["INTEGER"] + ["FLOAT"] * len(hft_orderbook.sources)
+    np.testing.assert_array_equal(column2array["key"], [HFT_KEY] * 4 + [HFT_KEY + 1] * 4)
+    for key, arr_action in [(HFT_KEY, arr_action_1), (HFT_KEY + 1, arr_action_2)]:
+        arr_expected = hft_orderbook.Orderbook().extract(arr_action)
+        is_key = column2array["key"] == key
+        arr_actual = np.column_stack([column2array[column][is_key] for column in hft_orderbook.sources])
+        np.testing.assert_allclose(arr_actual, arr_expected, rtol=0, atol=0, equal_nan=True)
+
+    assert connection.execute("SELECT count(*) FROM hft_ob(?)", [str(path_action)]).fetchone() == (8,)
+    assert connection.execute(
+        "SELECT key, count(*) FROM hft_ob(?) GROUP BY key ORDER BY key", [str(path_action)]
+    ).fetchall() == [(HFT_KEY, 4), (HFT_KEY + 1, 4)]
+
+
+def test_hft_ob_all_keys_pushes_down_key_equality(tmp_path):
+    path_action, arr_action = write_action_fixture(tmp_path)
+    write_action_fixture(tmp_path, HFT_KEY + 1, price_shift=20)
+
+    connection = duckdb.connect()
+    cursor = connection.execute("SELECT * FROM hft_ob(?) WHERE key = ?", [str(path_action), HFT_KEY])
+    column2array = cursor.fetchnumpy()
+    arr_actual = np.column_stack([column2array[column] for column in hft_orderbook.sources])
+    arr_expected = hft_orderbook.Orderbook().extract(arr_action)
+    np.testing.assert_array_equal(column2array["key"], [HFT_KEY] * 4)
+    np.testing.assert_allclose(arr_actual, arr_expected, rtol=0, atol=0, equal_nan=True)
+    assert connection.execute(
+        "SELECT action_num FROM hft_ob(?) WHERE key = ?", [str(path_action), HFT_KEY]
+    ).fetchall() == [(1.0,), (2.0,), (3.0,), (4.0,)]
+
+    assert connection.execute(
+        "SELECT count(*) FROM hft_ob(?) WHERE key = ?", [str(path_action), HFT_KEY + 99]
+    ).fetchone() == (0,)
+    assert connection.execute(
+        "SELECT count(*) FROM hft_ob(?) WHERE key >= ?", [str(path_action), HFT_KEY + 1]
+    ).fetchone() == (4,)
+    assert connection.execute(
+        "SELECT count(*) FROM hft_ob(?) WHERE action_num = 2", [str(path_action)]
+    ).fetchone() == (2,)
+
+    plan = "\n".join(
+        row[1]
+        for row in connection.execute(
+            f"EXPLAIN SELECT count(*) FROM hft_ob('{path_action}') WHERE key = {HFT_KEY}"
+        ).fetchall()
+    )
+    assert f"key={HFT_KEY}" in plan
+
+
+def test_hft_ob_all_keys_equality_does_not_scan_other_values(tmp_path):
+    path_action, _ = write_action_fixture(tmp_path)
+    env = lmdb.Environment(str(path_action), subdir=False, map_size=64 * 1024 * 1024)
+    with env.begin(write=True) as txn:
+        txn.put(struct.pack("=i", HFT_KEY + 1), b"invalid")
+    env.close()
+
+    connection = duckdb.connect()
+    assert connection.execute(
+        "SELECT count(*) FROM hft_ob(?) WHERE key = ?", [str(path_action), HFT_KEY]
+    ).fetchone() == (4,)
+    with pytest.raises(duckdb.InvalidInputException, match=f"Invalid HFT action value for key {HFT_KEY + 1}"):
+        connection.execute("SELECT count(*) FROM hft_ob(?)", [str(path_action)]).fetchone()
+
+
 def test_hft_ob_rejects_missing_key(tmp_path):
     path_action, _ = write_action_fixture(tmp_path)
 
@@ -161,6 +235,8 @@ def test_hft_ob_rejects_missing_or_invalid_file(tmp_path):
     path_invalid.write_bytes(b"invalid")
     with pytest.raises(duckdb.IOException, match="Failed to open LMDB environment"):
         duckdb.execute("SELECT count(*) FROM hft_ob(?, ?)", [str(path_invalid), HFT_KEY])
+    with pytest.raises(duckdb.IOException, match="Failed to open LMDB environment"):
+        duckdb.execute("SELECT count(*) FROM hft_ob(?)", [str(path_invalid)])
 
 
 def test_hft_ob_rejects_invalid_lmdb_value(tmp_path):
@@ -178,6 +254,11 @@ def test_hft_ob_rejects_invalid_lmdb_value(tmp_path):
 def test_hft_ob_rejects_null_parameters(parameters):
     with pytest.raises(duckdb.BinderException, match="filename and key cannot be NULL"):
         duckdb.execute("SELECT count(*) FROM hft_ob(?, ?)", parameters)
+
+
+def test_hft_ob_all_keys_rejects_null_filename():
+    with pytest.raises(duckdb.BinderException, match="filename cannot be NULL"):
+        duckdb.execute("SELECT count(*) FROM hft_ob(NULL)")
 
 
 @pytest.mark.parametrize(
